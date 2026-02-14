@@ -1,13 +1,15 @@
+import { Ollama } from 'ollama/browser';
 import type { ChatMessage, MoodType, PersonalityTraits, RelationshipState, Memory } from '../types';
 import { buildSystemPrompt } from '../utils/systemPrompt';
 
-interface OllamaResponse {
-  model: string;
-  message: {
-    role: string;
-    content: string;
-  };
-  done: boolean;
+// Create a configurable Ollama client instance
+let ollamaClient: Ollama = new Ollama({ host: 'http://localhost:11434' });
+
+/**
+ * Update the Ollama client when the endpoint changes
+ */
+export function setOllamaEndpoint(endpoint: string): void {
+  ollamaClient = new Ollama({ host: endpoint });
 }
 
 export async function sendMessageToOllama(
@@ -22,6 +24,9 @@ export async function sendMessageToOllama(
   modelName: string,
   onStream?: (chunk: string) => void
 ): Promise<string> {
+  // Update client if endpoint changed
+  setOllamaEndpoint(endpoint);
+
   const memoryStrings = memories
     .sort((a, b) => b.importance - a.importance)
     .slice(0, 15)
@@ -33,58 +38,31 @@ export async function sendMessageToOllama(
 
   // Build conversation history (last 20 messages for context)
   const history = messages.slice(-20).map((m) => ({
-    role: m.role,
+    role: m.role as 'user' | 'assistant',
     content: m.content,
   }));
 
-  const body = {
-    model: modelName,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...history,
-    ],
-    stream: true,
-    options: {
-      temperature: 0.8,
-      top_p: 0.9,
-      num_predict: 300,
-    },
-  };
-
   try {
-    const response = await fetch(`${endpoint}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+    const response = await ollamaClient.chat({
+      model: modelName,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...history,
+      ],
+      stream: true,
+      options: {
+        temperature: 0.8,
+        top_p: 0.9,
+        num_predict: 300,
+      },
     });
 
-    if (!response.ok) {
-      throw new Error(`Ollama error: ${response.status} ${response.statusText}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('No reader available');
-
-    const decoder = new TextDecoder();
     let fullResponse = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n').filter((l) => l.trim());
-
-      for (const line of lines) {
-        try {
-          const parsed: OllamaResponse = JSON.parse(line);
-          if (parsed.message?.content) {
-            fullResponse += parsed.message.content;
-            onStream?.(fullResponse);
-          }
-        } catch {
-          // Skip malformed JSON chunks
-        }
+    for await (const chunk of response) {
+      if (chunk.message?.content) {
+        fullResponse += chunk.message.content;
+        onStream?.(fullResponse);
       }
     }
 
@@ -137,8 +115,9 @@ function getFallbackResponse(mood: MoodType): string {
 
 export async function checkOllamaConnection(endpoint: string): Promise<boolean> {
   try {
-    const res = await fetch(`${endpoint}/api/tags`, { method: 'GET' });
-    return res.ok;
+    const client = new Ollama({ host: endpoint });
+    await client.list();
+    return true;
   } catch {
     return false;
   }
