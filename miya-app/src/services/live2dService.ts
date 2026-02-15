@@ -30,26 +30,56 @@ export class Live2DService {
       this.destroy();
     }
 
-    // Ensure non-zero dimensions — fallback to 800x800 to prevent WebGL errors
+    // Ensure non-zero dimensions — fallback to 800×800 to prevent WebGL errors
     const w = width > 0 ? width : 800;
     const h = height > 0 ? height : 800;
 
-    this.app = new PIXI.Application({
-      view: canvas,
-      width: w,
-      height: h,
-      backgroundAlpha: 0,
-      antialias: true,
-      resolution: window.devicePixelRatio || 1,
-      autoDensity: true,
-    });
+    // Explicitly set canvas dimensions BEFORE creating the PIXI Application.
+    // Without this, the WebGL context may report 0 for MAX_TEXTURE_IMAGE_UNITS
+    // which causes checkMaxIfStatementsInShader to throw.
+    canvas.width = w * (window.devicePixelRatio || 1);
+    canvas.height = h * (window.devicePixelRatio || 1);
+
+    try {
+      this.app = new PIXI.Application({
+        view: canvas,
+        width: w,
+        height: h,
+        backgroundAlpha: 0,
+        antialias: true,
+        resolution: window.devicePixelRatio || 1,
+        autoDensity: true,
+        // Request WebGL2 — needed for 32-bit index buffers used by Cubism 4 models.
+        // Falls back to WebGL1 automatically if unavailable.
+        preferWebGLVersion: 2,
+        powerPreference: 'high-performance',
+      } as any);  // `as any` because preferWebGLVersion is a valid v7 option but not in all type defs
+    } catch (error) {
+      // If PIXI.Application constructor fails (e.g. WebGL context error),
+      // ensure this.app is null so loadModel won't try to use a broken app.
+      this.app = null;
+      throw error;
+    }
+
+    // Log the WebGL version that was actually obtained
+    const gl = (this.app.renderer as any).gl as WebGLRenderingContext | undefined;
+    if (gl) {
+      const isWebGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+      console.log(`[Live2D] Renderer created — WebGL${isWebGL2 ? '2' : '1'}`);
+      if (!isWebGL2) {
+        console.warn(
+          '[Live2D] WebGL2 not available — 32-bit index buffers may not be supported. ' +
+          'Check chrome://gpu or update your GPU driver.'
+        );
+      }
+    }
   }
 
   /**
    * Load a Live2D model from configuration
    */
   async loadModel(config: Live2DModelConfig): Promise<void> {
-    if (!this.app) {
+    if (!this.app || !this.app.renderer) {
       throw new Error('PIXI app not initialized. Call init() first.');
     }
 
@@ -68,6 +98,13 @@ export class Live2DService {
         motionPreload: MotionPreloadStrategy.IDLE,
         autoInteract: false,
       });
+
+      // Guard: the app may have been destroyed while model was loading (StrictMode)
+      if (!this.app || !this.app.renderer) {
+        this.model.destroy();
+        this.model = null;
+        throw new Error('PIXI app was destroyed during model loading.');
+      }
 
       // Configure model transforms
       this.model.scale.set(config.scale);
@@ -288,7 +325,7 @@ export class Live2DService {
    * Resize the canvas and reposition the model
    */
   resize(width: number, height: number): void {
-    if (!this.app) return;
+    if (!this.app || !this.app.renderer) return;
     this.app.renderer.resize(width, height);
 
     if (this.model && this.config) {

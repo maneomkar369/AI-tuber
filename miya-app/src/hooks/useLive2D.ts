@@ -1,6 +1,7 @@
 /**
  * useLive2D Hook
  * Manages the Live2D model lifecycle, expressions, and interactions.
+ * Handles React StrictMode double-mount gracefully.
  */
 
 import { useState, useCallback, useRef, useEffect } from 'react';
@@ -31,7 +32,8 @@ export function useLive2D(options: UseLive2DOptions = {}): UseLive2DReturn {
   const { modelConfig, autoLoad = true } = options;
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const initRef = useRef(false);
+  // Track whether this effect cycle has been cancelled (StrictMode cleanup)
+  const destroyedRef = useRef(false);
 
   const [state, setState] = useState<Live2DModelState>({
     isLoaded: false,
@@ -58,8 +60,20 @@ export function useLive2D(options: UseLive2DOptions = {}): UseLive2DReturn {
         // Initialize PIXI app
         await live2dService.init(canvas, canvas.clientWidth, canvas.clientHeight);
 
+        // Abort if the effect was cleaned up while we were awaiting (StrictMode)
+        if (destroyedRef.current) {
+          live2dService.destroy();
+          return;
+        }
+
         // Load the model
         await live2dService.loadModel(modelCfg);
+
+        // Abort again in case cleanup happened during model load
+        if (destroyedRef.current) {
+          live2dService.destroy();
+          return;
+        }
 
         setState(prev => ({
           ...prev,
@@ -120,35 +134,35 @@ export function useLive2D(options: UseLive2DOptions = {}): UseLive2DReturn {
     });
   }, []);
 
-  // Auto-load on mount if autoLoad is true
-  // Use requestAnimationFrame to ensure the canvas has been laid out with real dimensions
+  // Auto-load on mount.
+  // Uses a single rAF to wait for the canvas element to exist in the DOM,
+  // then calls loadModel exactly once. No retry loop — PIXI init should not
+  // be retried via requestAnimationFrame as it can exhaust WebGL contexts.
   useEffect(() => {
-    if (!autoLoad || initRef.current) return;
+    if (!autoLoad) return;
 
-    const tryLoad = () => {
+    // Reset the cancelled flag for this effect cycle
+    destroyedRef.current = false;
+
+    // Single-frame delay so React has committed the DOM and the canvas ref is set
+    const rafId = requestAnimationFrame(() => {
+      if (destroyedRef.current) return;
+
       const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      // Wait until the canvas has non-zero dimensions (layout complete)
-      if (canvas.clientWidth > 0 && canvas.clientHeight > 0) {
-        initRef.current = true;
-        loadModel();
-      } else {
-        // Canvas not laid out yet — retry on next frame
-        requestAnimationFrame(tryLoad);
+      if (!canvas) {
+        console.warn('[useLive2D] Canvas ref not available after mount — skipping init');
+        return;
       }
-    };
 
-    // Delay one frame to let React commit the DOM
-    requestAnimationFrame(tryLoad);
-  }, [autoLoad, loadModel]);
+      loadModel();
+    });
 
-  // Cleanup on unmount
-  useEffect(() => {
     return () => {
+      destroyedRef.current = true;
+      cancelAnimationFrame(rafId);
       live2dService.destroy();
     };
-  }, []);
+  }, [autoLoad, loadModel]);
 
   return {
     state,
